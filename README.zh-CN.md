@@ -14,6 +14,50 @@
 - **原生 libwebp** —— 完整的编/解码 C 源码原样内置并从零编译，当前打包架构为 `arm64-v8a`。
 - **帧缓存** —— 带设备自适应的内存预算和异步回填（refill）。
 
+## 工作原理 & 与原生 WebP / Glide 的区别
+
+本库采用**一次性全量解码 + GPU 合成**：用原生 libwebp（JNI）把 WebP 的**每一帧
+一次性**解码为 RGBA、存进 native 内存缓冲，之后播放就是纯粹的 OpenGL ES 纹理切换。
+播放阶段几乎不占主线程 / CPU（由 GPU 合成），且解码后的帧会被缓存（读取时 clone、
+LRU 淘汰、设备自适应预算）并在多个 View 间复用。
+
+这与系统的 `AnimatedImageDrawable` 或 Glide 是完全不同的取舍——后两者是
+**每一轮循环都在 CPU 上按需解码**、再通过 View 的 canvas 绘制：
+
+| | **WebpKit（本库）** | **系统 `ImageDecoder` / `AnimatedImageDrawable`** | **Glide（动画 WebP）** |
+|---|---|---|---|
+| 解码模型 | 所有帧**一次性**预解码（原生） | **按需**解码，每轮循环都解 | 按需（API 28+ 委托给系统解码器） |
+| 播放开销 | GPU 纹理切换，**几乎无逐帧 CPU** | 每轮循环都做逐帧 CPU 解码 | 逐帧 CPU 解码 + Glide 流水线 |
+| 多个动画并存 | **单个** GL surface，一个绘制循环画所有图层 | N 个 View → N 套 invalidate/onDraw | N 个 Drawable → N 套 invalidate |
+| 合成方式 | **GPU** | View 的 CPU / 硬件 canvas | View 的 CPU / 硬件 canvas |
+| 内存 | **较高** —— 所有帧常驻 | 较低 —— 只保留当前帧 | 较低 + Glide 缓存 |
+| 网络 / 磁盘加载 | 不内置（走 raw 资源） | 无 | **有** —— Glide 的强项 |
+| RecyclerView / 列表 | **不适合**（GL surface + z-order） | 适合 | **最佳** —— 专为此设计 |
+| 在动画上盖 `View` | 需要 `MultiWebpGLViewContainer`（见 [Z-order](#z-order在动画之上叠加-view)） | 轻松 | 轻松 |
+
+**适合用 WebpKit 的场景**：在相对静态的页面上播放少量高帧率 / 多图层动画（开屏、
+全屏特效、角色 / 贴纸合成），追求极顺滑的播放和极低的 CPU 占用。**列表 / 可滚动内容、
+远程加载的图片、或需要随意在其上叠加视图**时，请优先用系统解码器或 Glide。
+
+### 性能优势
+
+- **播放期无逐帧 CPU 解码** —— 帧已预解码，每显示一帧只是一次 `glTexSubImage2D` +
+  绘制，即使高帧率、多图层也依然顺滑。
+- **解码一次，处处复用** —— `WebPAnimResultManager` 缓存 native 帧（读取时 clone、
+  LRU、按设备的内存预算）；同一资源在多个 View 显示也只解码一次。
+- **多图层共用一个 surface** —— `MultiWebpGLView` 在一个 GL 上下文 / 一个帧循环里
+  合成 N 个动画，而不是 N 个动画 View 各自触发 invalidate → onDraw。
+- **解码在非主线程**，并显式释放 native 内存。
+
+### 取舍（请务必了解）
+
+- **内存** —— 每一帧都解码并常驻，所以长 / 大的 WebP 比按需解码更吃 RAM。可传
+  `size` / `decodeSize` 在解码时降采样。
+- **Z-order** —— GL 系列 View 使用了 `setZOrderOnTop(true)`，surface 会被画在
+  **所有兄弟 View 之上**，无法直接在它上面盖普通 `View`。解决办法见
+  [Z-order](#z-order在动画之上叠加-view)。
+- **不适合 RecyclerView** —— surface 生命周期 / 资源冲突会导致闪烁。
+
 ## 公开 API
 
 | 类 | 作用 |
@@ -128,7 +172,45 @@ gl.setLayerPosition(1, 100f, 100f)   // 不重新解码即可移动图层
 gl.hideLayer(1)                       // 切换可见性
 ```
 
-> ⚠️ GL 系列 View 使用了 `setZOrderOnTop(true)`，**不适合**放在 `RecyclerView` 里
+### Z-order：在动画之上叠加 View
+
+由于 GL 系列 View 使用了 `setZOrderOnTop(true)`，动画 surface 会被画在**所有兄弟
+View 之上**——把普通 `View` 作为兄弟节点加进去，并*不会*盖在动画上面。当你需要在
+某个动画上叠加普通 `View`（角标、按钮、文字、倒计时……）时，请用
+**`MultiWebpGLViewContainer`**：它会把**单个**图层从 GL surface 上「抬」下来，用一个
+位置 / 尺寸完全一致的 `WebpImageView` 放进正常 View 层级里（原图层处的 GL surface
+变透明），这样覆盖视图就又能生效了——同时其余图层继续在 GPU 上正常播放、不受影响。
+
+```kotlin
+val container = MultiWebpGLViewContainer(context)
+container.glView.setLayers(
+    listOf(
+        WebpLayer(R.raw.bg,    x = 0f,  y = 0f,  width = 300f, height = 300f, fps = 24),
+        WebpLayer(R.raw.badge, x = 80f, y = 80f, width = 140f, height = 140f, fps = 12),
+    )
+)
+container.glView.start()
+
+// 把第 1 层从 GL surface 抬下来，这样普通 View 才能盖在它上面。
+// onFrozen 会在交接无缝完成后回调（覆盖层已绘制、GL 图层已隐藏）。
+container.freezeLayer(1, onFrozen = {
+    val label = TextView(context).apply { text = "NEW" }
+    container.addView(
+        label,
+        FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+            leftMargin = 80; topMargin = 80   // 正好盖在（已冻结的）图层上方
+        },
+    )
+})
+
+// 不再需要覆盖层时，把图层交还给 GPU surface。
+container.unfreezeLayer(1)
+```
+
+`freezeLayer` / `unfreezeLayer` 是无缝的（覆盖层只在真正绘制出一帧后才换入 / 换出），
+可重复调用；如需延迟交换还可传 `delayMs`。
+
+> ⚠️ 即便有了容器，也**仍然**不要把任何 GL 系列 View 放进 `RecyclerView`
 > （表面生命周期 / 资源冲突会导致黑屏或闪烁）。
 
 ## 初始化

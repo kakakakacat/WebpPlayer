@@ -16,6 +16,58 @@ platform `ImageDecoder` / `AnimatedImageDrawable` pipeline.
   scratch (no prebuilt binaries), currently packaged for `arm64-v8a`.
 - **Frame caching** with a device-aware memory budget and async refill.
 
+## How it works & how it compares
+
+This library uses **full-decode + GPU compositing**: every frame of the WebP is
+decoded to RGBA *once* by native libwebp (JNI) into native-backed buffers, then
+played back as plain OpenGL ES texture swaps. Playback costs almost no
+main-thread/CPU work — the GPU composites — and decoded frames are cached
+(clone-on-read, LRU, device-aware budget) and reused across views.
+
+That is a very different trade-off from the platform `AnimatedImageDrawable` or
+Glide, which decode **on demand, every loop, on the CPU** and draw through the
+View's canvas:
+
+| | **WebpKit (this lib)** | **Platform `ImageDecoder` / `AnimatedImageDrawable`** | **Glide (animated WebP)** |
+|---|---|---|---|
+| Decode model | All frames decoded **once**, up front (native) | Frames decoded **on demand**, every loop | On demand (delegates to platform decoder on API 28+) |
+| Playback cost | GPU texture swap — **~no per-frame CPU** | Per-frame CPU decode on every loop | Per-frame CPU decode + Glide pipeline |
+| Many concurrent anims | **One** GL surface, one draw loop for all layers | N Views → N invalidate/onDraw cycles | N Drawables → N invalidate cycles |
+| Compositing | **GPU** | CPU / HW canvas via View | CPU / HW canvas via View |
+| Memory | **Higher** — all frames stay resident | Lower — only working frames | Lower + Glide caches |
+| Remote / disk loading | Not built in (raw resources) | No | **Yes** — Glide's strength |
+| RecyclerView / lists | **Not suitable** (GL surface + z-order) | Fine | **Best** — designed for it |
+| Draw a `View` on top | Needs `MultiWebpGLViewContainer` (see [Z-order](#z-order-drawing-a-view-above-the-animation)) | Trivial | Trivial |
+
+**Use WebpKit** when you have a few high-fps / multi-layer animations on a
+relatively static screen (splash screens, full-screen effects, character /
+sticker compositions) and want buttery-smooth playback with minimal CPU.
+**Prefer the platform decoder or Glide** for list / scrolling content, remotely
+loaded images, or when you must freely stack views on top.
+
+### Performance advantages
+
+- **No per-frame CPU decode during playback** — frames are pre-decoded; each
+  displayed frame is a single `glTexSubImage2D` + draw, so playback stays smooth
+  even at high fps and with several layers.
+- **Decode once, reuse everywhere** — `WebPAnimResultManager` caches
+  native-backed frames (clone-on-read, LRU, per-device memory budget); the same
+  resource shown in multiple views is decoded only once.
+- **Multi-layer on a single surface** — `MultiWebpGLView` composites N animations
+  in one GL context / one frame loop, instead of N animated views each driving
+  their own invalidate → onDraw.
+- **Off-main-thread decode** and explicit native-memory release.
+
+### Trade-offs (read this)
+
+- **Memory** — every frame is decoded and kept resident, so a long / large WebP
+  costs more RAM than the on-demand decoders. Pass the `size` / `decodeSize`
+  hints to downscale at decode time.
+- **Z-order** — the GL views call `setZOrderOnTop(true)`, so the surface is drawn
+  **above every sibling view**; you cannot draw a normal `View` on top of it
+  directly. See [Z-order](#z-order-drawing-a-view-above-the-animation) for the fix.
+- **Not for RecyclerView** — surface lifecycle / resource conflicts cause flicker.
+
 ## Modules / public API
 
 | Class | What it does |
@@ -126,8 +178,49 @@ gl.setLayerPosition(1, 100f, 100f)   // move a layer without re-decoding
 gl.hideLayer(1)                       // toggle visibility
 ```
 
-> ⚠️ The GL views use `setZOrderOnTop(true)` and are **not** suitable for use
-> inside a `RecyclerView` (surface lifecycle / resource conflicts cause flicker).
+### Z-order: drawing a `View` above the animation
+
+Because the GL views call `setZOrderOnTop(true)`, the animation surface is drawn
+**above all sibling views** — adding a normal `View` next to it will *not* place
+it on top of the animation. When you need to overlay a regular `View` (badge,
+button, label, countdown…) on top of one animation, use
+**`MultiWebpGLViewContainer`**. It lifts a *single* layer off the GL surface and
+replaces it, pixel-for-pixel, with a `WebpImageView` in the normal view hierarchy
+(the GL surface goes transparent where that layer was), so covering views work
+again — while every other layer keeps GPU-animating, untouched.
+
+```kotlin
+val container = MultiWebpGLViewContainer(context)
+container.glView.setLayers(
+    listOf(
+        WebpLayer(R.raw.bg,    x = 0f,  y = 0f,  width = 300f, height = 300f, fps = 24),
+        WebpLayer(R.raw.badge, x = 80f, y = 80f, width = 140f, height = 140f, fps = 12),
+    )
+)
+container.glView.start()
+
+// Lift layer #1 off the GL surface so a normal View can be drawn above it.
+// onFrozen fires once the hand-off is seamless (overlay drawn, GL layer hidden).
+container.freezeLayer(1, onFrozen = {
+    val label = TextView(context).apply { text = "NEW" }
+    container.addView(
+        label,
+        FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply {
+            leftMargin = 80; topMargin = 80   // sits above the (now frozen) layer
+        },
+    )
+})
+
+// Hand the layer back to the GPU surface when the overlay is no longer needed.
+container.unfreezeLayer(1)
+```
+
+`freezeLayer` / `unfreezeLayer` are seamless (the overlay is only swapped in/out
+after a real frame has been drawn) and safe to call repeatedly. They also accept
+a `delayMs` if you want to defer the swap.
+
+> ⚠️ Still avoid **all** GL views inside a `RecyclerView` (surface lifecycle /
+> resource conflicts cause flicker), even via the container.
 
 ## Initialization
 
