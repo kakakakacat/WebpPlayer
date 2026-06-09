@@ -106,6 +106,10 @@ class WebpRenderer(
     @Volatile
     private var playing = false  // 播放状态标志
 
+    // 诊断日志辅助：首帧只打一次，无帧告警按秒节流
+    private var firstFrameLogged = false
+    private var lastNoFrameLogMs = 0L
+
     // ========== Foreground 相关 ==========
     private val foregroundTexIds = IntArray(1)
     private var foregroundTextureAllocated = false
@@ -222,6 +226,11 @@ class WebpRenderer(
         aTexLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
         uMvpLoc = GLES20.glGetUniformLocation(program, "uMVP")
         texSamplerLoc = GLES20.glGetUniformLocation(program, "tex")
+        if (program == 0) {
+            WebpLog.e(TAG, "onSurfaceCreated: 着色器程序创建失败，GL 无法渲染 —— 屏幕将为空白")
+        } else {
+            WebpLog.i(TAG, "onSurfaceCreated: GL 就绪 program=$program, hasPendingAnim=${pendingAnim != null}")
+        }
 
         // 主纹理
         GLES20.glGenTextures(1, texIds, 0)
@@ -300,8 +309,21 @@ class WebpRenderer(
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        val f = frames ?: return
-        if (f.isEmpty()) return
+        val f = frames
+        if (f == null || f.isEmpty()) {
+            // 节流打印：避免 60fps 刷屏，但又能在「看不到 webp」时确认渲染线程是否拿到了帧
+            val now = System.currentTimeMillis()
+            if (now - lastNoFrameLogMs > 1000) {
+                lastNoFrameLogMs = now
+                WebpLog.w(TAG, "onDrawFrame: 没有可渲染的帧 (frames=${if (f == null) "null" else "empty"}, playing=$playing) —— 屏幕为空白")
+            }
+            return
+        }
+
+        if (!firstFrameLogged) {
+            firstFrameLogged = true
+            WebpLog.i(TAG, "onDrawFrame: 首帧绘制 frames=${f.size}, frame=${frameWidth}x${frameHeight}, view=${viewWidth}x${viewHeight}, playing=$playing")
+        }
 
         if (!playing) {
             drawQuad()
@@ -485,7 +507,14 @@ class WebpRenderer(
     // 将原本在 setAnimatedFrames 中对 GL 的操作提取到这里（必须在 GL 线程并且在 GL 已就绪时调用）
     private fun applyAnimResult(anim: WebPAnimResult) {
         // copy frames array (keep direct buffers)
-        val arr = anim.frames ?: return
+        val arr = anim.frames
+        if (arr == null) {
+            WebpLog.w(TAG, "applyAnimResult: anim.frames 为 null，无内容可渲染")
+            return
+        }
+        if (arr.isEmpty()) {
+            WebpLog.w(TAG, "applyAnimResult: 0 帧，无内容可渲染")
+        }
         this.frames = arr
         this.frameWidth = anim.canvasWidth
         this.frameHeight = anim.canvasHeight
@@ -509,6 +538,7 @@ class WebpRenderer(
 
         this.currentFrameIndex = 0
         this.lastFrameTimeMs = System.currentTimeMillis()
+        firstFrameLogged = false
         textureAllocated = false // ensure allocation occurs below
 
         // allocate texture storage and upload first frame immediately to avoid black first frame
@@ -524,6 +554,7 @@ class WebpRenderer(
             )
         }
         computeMvp()
+        WebpLog.i(TAG, "applyAnimResult 完成: frames=${arr.size}, frame=${frameWidth}x${frameHeight}, render=${renderWidth}x${renderHeight}, view=${viewWidth}x${viewHeight}, fpsOverride=$fpsOverride")
         // 不再需要手动请求渲染，RENDERMODE_CONTINUOUSLY 会自动渲染
     }
 
