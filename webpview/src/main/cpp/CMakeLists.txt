@@ -22,6 +22,27 @@ file(GLOB WEBP_DEMUX_SOURCES   ${WEBP_SRC}/demux/*.c)
 file(GLOB WEBP_MUX_SOURCES     ${WEBP_SRC}/mux/*.c)
 file(GLOB SHARPYUV_SOURCES     ${WEBP_ROOT}/sharpyuv/*.c)
 
+# libyuv: NEON-optimized ARGBScale for frame down-scaling. Sources self-guard per
+# arch like libwebp; jpeg-dependent files are excluded (no libjpeg dependency).
+# SVE/SME kernels are disabled: they need extra -march flags and none of our
+# target SoCs support them. Unused entry points are stripped by --gc-sections.
+set(LIBYUV_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/libyuv)
+file(GLOB LIBYUV_SOURCES ${LIBYUV_ROOT}/source/*.cc)
+list(FILTER LIBYUV_SOURCES EXCLUDE REGEX ".*(mjpeg_decoder|mjpeg_validate|convert_jpeg)\\.cc$")
+
+# Same as libyuv's own CMakeLists: the *_neon64.cc kernels use dotprod/i8mm
+# instructions and need the extended -march to assemble. Runtime CPU detection
+# (cpu_id.cc) keeps them off SoCs that lack the features.
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    set_source_files_properties(
+            ${LIBYUV_ROOT}/source/compare_neon64.cc
+            ${LIBYUV_ROOT}/source/rotate_neon64.cc
+            ${LIBYUV_ROOT}/source/row_neon64.cc
+            ${LIBYUV_ROOT}/source/scale_neon64.cc
+            PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm"
+    )
+endif()
+
 add_library(webpkit SHARED
         ${WEBP_DEC_SOURCES}
         ${WEBP_DSP_SOURCES}
@@ -30,17 +51,21 @@ add_library(webpkit SHARED
         ${WEBP_DEMUX_SOURCES}
         ${WEBP_MUX_SOURCES}
         ${SHARPYUV_SOURCES}
+        ${LIBYUV_SOURCES}
         WebPYUVDecoder.cpp
 )
 
 target_include_directories(webpkit PRIVATE
         ${WEBP_ROOT}
         ${WEBP_SRC}
+        ${LIBYUV_ROOT}/include
 )
 
 target_compile_definitions(webpkit PRIVATE
         HAVE_PTHREAD
         WEBP_USE_THREAD
+        LIBYUV_DISABLE_SVE
+        LIBYUV_DISABLE_SME
 )
 
 target_compile_options(webpkit PRIVATE
