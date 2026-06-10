@@ -88,7 +88,7 @@ afterEvaluate {
                 artifactId = "player"
                 // 本地联调可覆盖版本号发布到 mavenLocal，正式发布仍用默认值：
                 //   ./gradlew :webpview:publishReleasePublicationToMavenLocal -PpublishVersion=1.0.2-local
-                version = (findProperty("publishVersion") as String?) ?: "1.0.2"
+                version = (findProperty("publishVersion") as String?) ?: "1.0.3"
             }
         }
     }

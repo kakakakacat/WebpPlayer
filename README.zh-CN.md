@@ -98,7 +98,7 @@ App 的 `build.gradle.kts`：
 
 ```kotlin
 dependencies {
-    implementation("io.webpkit:player:1.0.2")
+    implementation("io.webpkit:player:1.0.3")
 }
 ```
 
@@ -109,17 +109,17 @@ dependencies {
 // settings.gradle
 maven { url 'https://raw.githubusercontent.com/kakakakacat/WebpPlayer/mvn-repo/' }
 // build.gradle
-implementation 'io.webpkit:player:1.0.2'
+implementation 'io.webpkit:player:1.0.3'
 ```
 </details>
 
 ### 方式 B —— 手动丢 AAR
 
-把 `player-1.0.2.aar` 拷进 App 的 `libs/` 目录，然后：
+把 `player-1.0.3.aar` 拷进 App 的 `libs/` 目录，然后：
 
 ```kotlin
 dependencies {
-    implementation(files("libs/player-1.0.2.aar"))
+    implementation(files("libs/player-1.0.3.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
 }
