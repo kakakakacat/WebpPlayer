@@ -10,11 +10,22 @@ data class WebpDeviceProfile(
     val cacheBudgetBytes: Long,
     val maxCacheEntries: Int,
 ) {
+    /**
+     * 全局共享的解码 dispatcher。`limitedParallelism` 每次调用都会返回一个**独立**的
+     * 限流器，之前每个 view / 每次 launch 各建一个，并行度限制形同虚设；这里按并行度
+     * 缓存单例，保证全进程解码并发受同一个上限约束。
+     */
     fun decodeDispatcher(): CoroutineDispatcher {
-        return Dispatchers.IO.limitedParallelism(decodeParallelism.coerceAtLeast(1))
+        val parallelism = decodeParallelism.coerceAtLeast(1)
+        return sharedDecodeDispatchers.getOrPut(parallelism) {
+            Dispatchers.IO.limitedParallelism(parallelism)
+        }
     }
 
     companion object {
+        private val sharedDecodeDispatchers =
+            java.util.concurrent.ConcurrentHashMap<Int, CoroutineDispatcher>()
+
         fun current(): WebpDeviceProfile {
             return resolve(
                 model = Build.MODEL.orEmpty(),

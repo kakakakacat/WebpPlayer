@@ -3,6 +3,7 @@ package io.webpkit.player
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
+import android.os.SystemClock
 import android.util.Size
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -82,7 +83,8 @@ class WebpRenderer(
     private var frameWidth = 0
     private var frameHeight = 0
     private var currentFrameIndex = 0
-    private var lastFrameTimeMs = System.currentTimeMillis()
+    // 帧调度一律用 uptimeMillis：墙钟（currentTimeMillis）被校时/改时间会让动画卡死或狂奔
+    private var lastFrameTimeMs = SystemClock.uptimeMillis()
 
     // 渲染目标尺寸（用于控制实际显示大小），默认与帧尺寸一致
     private var renderWidth = 0
@@ -93,6 +95,16 @@ class WebpRenderer(
 
     // fps 覆盖（>0 表示用固定时长 1000/fps）
     private var fpsOverride = 0
+
+    // ===== 有限循环（loop_count > 0 的 webp 播 N 次后停止）=====
+    private var loopCount = 0          // 0 = 无限循环
+    private var completedLoops = 0
+    /** 播放完成（停在末帧，不再调度） */
+    @Volatile
+    private var playbackFinished = false
+    /** 播完后已回收除末帧外的 native 内存；重播必须重新 setFromAnimResult */
+    @Volatile
+    private var framesTrimmed = false
 
     // 新增：在 GL 未就绪时缓存 anim，onSurfaceCreated 时应用
     @Volatile
@@ -163,8 +175,54 @@ class WebpRenderer(
     fun start() {
         playing = true
         frameHandler.removeCallbacksAndMessages(null)
-        lastFrameTimeMs = System.currentTimeMillis()
+        lastFrameTimeMs = SystemClock.uptimeMillis()
         requestRender()
+    }
+
+    /**
+     * 播放完成且帧内存已回收时为 true。此时 renderer 自己没有数据可重播，
+     * 调用方（如 WebpGLView.start）需要重新走一次 setFromAnimResult（缓存命中时
+     * 只是引用计数 +1，代价很低）。
+     */
+    fun needsReloadForReplay(): Boolean = playbackFinished && framesTrimmed
+
+    /**
+     * 在 GL 线程调用：播放已完成且帧数据仍完整（未回收）时从头重播。
+     * 普通暂停->恢复不受影响（playbackFinished 为 false 时这里是 no-op）。
+     * 帧 buffer 解码后只读，所以直接复位索引重新上传不存在脏数据问题。
+     */
+    fun restartIfFinished() {
+        if (!playbackFinished || framesTrimmed) return
+        completedLoops = 0
+        playbackFinished = false
+        currentFrameIndex = 0
+        lastFrameTimeMs = SystemClock.uptimeMillis()
+        if (frames?.isNotEmpty() == true && program != 0) {
+            uploadCurrentFrameRGBA()
+        }
+        requestRender()
+    }
+
+    /** 播放完成：停在当前（末）帧，回收其余帧的 native 内存。 */
+    private fun finishPlayback() {
+        playbackFinished = true
+        val f = frames ?: return
+        if (f.size <= 1) return
+        val keepIdx = currentFrameIndex.coerceIn(0, f.size - 1)
+        val keep = f[keepIdx]
+        // 只保留正在显示的末帧（surface 重建时还要靠它重新上传纹理），其余全部释放。
+        // 释放走 native 引用计数，缓存若还持有同一块内存则只是计数 -1，不会悬空。
+        val rest = Array(f.size - 1) { i -> f[if (i < keepIdx) i else i + 1] }
+        try {
+            val freedKB = WebPYUVDecoder.releaseNativeBuffers(rest)
+            WebpLog.i(TAG, "finishPlayback: 播放完成(loop=$loopCount)，回收 ${f.size - 1} 帧，freed=$freedKB KB")
+        } catch (t: Throwable) {
+            WebpLog.e(TAG, "finishPlayback: release failed: ${t.message}")
+        }
+        // 丢弃旧数组：被释放帧的 ByteBuffer 不再可达，杜绝后续误用已释放内存
+        frames = arrayOf(keep)
+        currentFrameIndex = 0
+        framesTrimmed = true
     }
 
     fun stop() {
@@ -198,17 +256,39 @@ class WebpRenderer(
                     WebpLog.d(TAG, "setFromAnimResult: released old frames, freed $freedKB KB")
                 }
                 applyAnimResult(anim)
+                // 直接应用成功后，残留的旧 pendingAnim 不会再被消费，必须释放
+                replacePendingAnim(null)
             } catch (t: Throwable) {
                 WebpLog.e(TAG, "setFromAnimResult apply failed: ${t.message}")
                 // 保留到 pending 以便 onSurfaceCreated 时重试
-                pendingAnim = anim
+                replacePendingAnim(anim)
             }
         } else {
             val freedKB = releaseFrames()
             if (freedKB > 0) {
                 WebpLog.d(TAG, "setFromAnimResult: released old frames (no program), freed $freedKB KB")
             }
-            pendingAnim = anim
+            replacePendingAnim(anim)
+        }
+    }
+
+    /**
+     * 替换 pendingAnim。被覆盖的旧 pendingAnim 不会有任何人消费，必须在这里释放它持有的
+     * native buffer，否则 GL 未就绪期间连续 set 两次就泄漏一份完整动画。
+     */
+    private fun replacePendingAnim(anim: WebPAnimResult?) {
+        val old = pendingAnim
+        pendingAnim = anim
+        if (old != null && old !== anim) {
+            val stale = old.frames ?: return
+            try {
+                val freedKB = WebPYUVDecoder.releaseNativeBuffers(stale)
+                if (freedKB > 0) {
+                    WebpLog.d(TAG, "replacePendingAnim: released stale pendingAnim, freed $freedKB KB")
+                }
+            } catch (t: Throwable) {
+                WebpLog.e(TAG, "replacePendingAnim: release stale pendingAnim failed: ${t.message}")
+            }
         }
     }
 
@@ -312,7 +392,7 @@ class WebpRenderer(
         val f = frames
         if (f == null || f.isEmpty()) {
             // 节流打印：避免 60fps 刷屏，但又能在「看不到 webp」时确认渲染线程是否拿到了帧
-            val now = System.currentTimeMillis()
+            val now = SystemClock.uptimeMillis()
             if (now - lastNoFrameLogMs > 1000) {
                 lastNoFrameLogMs = now
                 WebpLog.w(TAG, "onDrawFrame: 没有可渲染的帧 (frames=${if (f == null) "null" else "empty"}, playing=$playing) —— 屏幕为空白")
@@ -325,19 +405,36 @@ class WebpRenderer(
             WebpLog.i(TAG, "onDrawFrame: 首帧绘制 frames=${f.size}, frame=${frameWidth}x${frameHeight}, view=${viewWidth}x${viewHeight}, playing=$playing")
         }
 
-        if (!playing) {
+        // 单帧（静态 webp）没有动画可推进；播放完成的有限循环动画停在末帧。
+        // 两种情况都画完即止，不再定时唤醒重复上传同一帧
+        if (!playing || f.size <= 1 || playbackFinished) {
             drawQuad()
             drawForeground()
             return
         }
 
-        val now = System.currentTimeMillis()
+        val now = SystemClock.uptimeMillis()
         val dur = if (fpsOverride > 0) 1000L / fpsOverride else frameDurations.getOrElse(currentFrameIndex) { 100 }.toLong()
         val elapsed = now - lastFrameTimeMs
 
         if (elapsed >= dur) {
+            val atLastFrame = currentFrameIndex == f.size - 1
+            if (atLastFrame && loopCount > 0 && completedLoops + 1 >= loopCount) {
+                // 有限循环播放完毕：停在末帧并回收其余帧内存
+                completedLoops = loopCount
+                finishPlayback()
+                drawQuad()
+                drawForeground()
+                return
+            }
+            if (atLastFrame) completedLoops++
             currentFrameIndex = (currentFrameIndex + 1) % f.size
-            lastFrameTimeMs = now
+            // 累加而非重置为 now：每帧丢弃余量会让动画整体变慢；
+            // 但落后超过一帧（如长时间暂停后）直接对齐，避免追帧狂奔
+            lastFrameTimeMs += dur
+            if (now - lastFrameTimeMs >= dur) {
+                lastFrameTimeMs = now
+            }
             uploadCurrentFrameRGBA()
         }
 
@@ -345,7 +442,7 @@ class WebpRenderer(
         drawForeground()
 
         // 计算下一帧延迟并按需请求渲染，避免 GL 线程 sleep
-        val nextDelay = (dur - (System.currentTimeMillis() - lastFrameTimeMs)).coerceAtLeast(1)
+        val nextDelay = (dur - (SystemClock.uptimeMillis() - lastFrameTimeMs)).coerceAtLeast(1)
         frameHandler.postDelayed({ if (playing) requestRender() }, nextDelay)
     }
 
@@ -537,7 +634,11 @@ class WebpRenderer(
         }
 
         this.currentFrameIndex = 0
-        this.lastFrameTimeMs = System.currentTimeMillis()
+        this.lastFrameTimeMs = SystemClock.uptimeMillis()
+        this.loopCount = anim.loopCount
+        this.completedLoops = 0
+        this.playbackFinished = false
+        this.framesTrimmed = false
         firstFrameLogged = false
         textureAllocated = false // ensure allocation occurs below
 
@@ -571,7 +672,8 @@ class WebpRenderer(
             this.frameHeight = height
             this.frameDurations = durations ?: IntArray(nonNull.size) { 100 }
             this.currentFrameIndex = 0
-            this.lastFrameTimeMs = System.currentTimeMillis()
+            this.lastFrameTimeMs = SystemClock.uptimeMillis()
+            resetLoopStateForRawFrames()
             computeMvp()
             // 不执行 GLES 上传，等待 onSurfaceCreated 时统一上传
             return
@@ -593,7 +695,8 @@ class WebpRenderer(
             renderHeight = height
         }
         this.currentFrameIndex = 0
-        this.lastFrameTimeMs = System.currentTimeMillis()
+        this.lastFrameTimeMs = SystemClock.uptimeMillis()
+        resetLoopStateForRawFrames()
         ensureTextureAllocated()
         if (nonNull.isNotEmpty()) {
             val first = nonNull[0]
@@ -607,6 +710,14 @@ class WebpRenderer(
         }
         computeMvp()
         // 不再需要手动请求渲染，RENDERMODE_CONTINUOUSLY 会自动渲染
+    }
+
+    /** setAnimatedFrames 直传的裸帧数组没有 loop 信息，保持旧行为：无限循环 */
+    private fun resetLoopStateForRawFrames() {
+        loopCount = 0
+        completedLoops = 0
+        playbackFinished = false
+        framesTrimmed = false
     }
 
     /**

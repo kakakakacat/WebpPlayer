@@ -8,6 +8,7 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.Size
 import androidx.annotation.RawRes
@@ -75,7 +76,14 @@ private class LayerState(val config: WebpLayer) {
 
     // Playback
     var currentFrameIndex: Int = 0
-    var lastFrameTimeMs: Long = System.currentTimeMillis()
+    var lastFrameTimeMs: Long = SystemClock.uptimeMillis()
+
+    // Finite-loop playback (webp loop_count > 0): play N times then hold the
+    // last frame and reclaim the other frames' native memory.
+    var loopCount: Int = 0          // 0 = loop forever
+    var completedLoops: Int = 0
+    @Volatile var playbackFinished: Boolean = false
+    @Volatile var framesTrimmed: Boolean = false
 
     // GL
     val texId: IntArray = IntArray(1)
@@ -209,6 +217,8 @@ private class MultiRenderer(
                 old.texId[0] = 0
             }
             old.releaseNativeFrames()
+            // 未被消费的 pendingAnim 同样持有 native buffer，不释放就泄漏
+            old.replacePendingAnim(null)
         }
         layers = newLayers
         // Allocate textures + upload first frame if program already up
@@ -236,7 +246,7 @@ private class MultiRenderer(
         playing = shouldPlay
         frameHandler.removeCallbacks(frameTick)
         if (shouldPlay) {
-            layers.forEach { it.lastFrameTimeMs = System.currentTimeMillis() }
+            layers.forEach { it.lastFrameTimeMs = SystemClock.uptimeMillis() }
         }
     }
 
@@ -325,7 +335,7 @@ private class MultiRenderer(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
 
         var nextWakeMs = Long.MAX_VALUE
-        val now = System.currentTimeMillis()
+        val now = SystemClock.uptimeMillis()
 
         currentLayers.forEach { layer ->
             // Apply any pending anim that arrived from IO thread
@@ -338,7 +348,8 @@ private class MultiRenderer(
             if (frames.isEmpty()) return@forEach
             if (!layer.textureAllocated) allocTexture(layer)
 
-            if (playing) {
+            // 单帧图层无动画可推进；播放完成的有限循环图层停在末帧——都不再参与调度
+            if (playing && frames.size > 1 && !layer.playbackFinished) {
                 val fps = layer.effectiveFps()
                 val dur = if (fps > 0) {
                     (1000L / fps)
@@ -347,12 +358,26 @@ private class MultiRenderer(
                 }
                 val elapsed = now - layer.lastFrameTimeMs
                 if (elapsed >= dur) {
-                    layer.currentFrameIndex = (layer.currentFrameIndex + 1) % frames.size
-                    layer.lastFrameTimeMs = now
-                    uploadFrame(layer)
+                    val atLastFrame = layer.currentFrameIndex == frames.size - 1
+                    if (atLastFrame && layer.loopCount > 0 && layer.completedLoops + 1 >= layer.loopCount) {
+                        // 有限循环播完：停在末帧并回收其余帧内存
+                        layer.completedLoops = layer.loopCount
+                        finishLayerPlayback(layer)
+                    } else {
+                        if (atLastFrame) layer.completedLoops++
+                        layer.currentFrameIndex = (layer.currentFrameIndex + 1) % frames.size
+                        // 累加而非重置为 now，避免每帧丢余量导致整体变慢；落后超一帧则对齐
+                        layer.lastFrameTimeMs += dur
+                        if (now - layer.lastFrameTimeMs >= dur) {
+                            layer.lastFrameTimeMs = now
+                        }
+                        uploadFrame(layer)
+                    }
                 }
-                val timeUntilNext = (dur - (System.currentTimeMillis() - layer.lastFrameTimeMs)).coerceAtLeast(1L)
-                if (timeUntilNext < nextWakeMs) nextWakeMs = timeUntilNext
+                if (!layer.playbackFinished) {
+                    val timeUntilNext = (dur - (SystemClock.uptimeMillis() - layer.lastFrameTimeMs)).coerceAtLeast(1L)
+                    if (timeUntilNext < nextWakeMs) nextWakeMs = timeUntilNext
+                }
             }
 
             // Draw layer
@@ -374,6 +399,29 @@ private class MultiRenderer(
     // Internal helpers
     // ---------------------------------------------------------------------------
 
+    /**
+     * 图层播放完成（GL 线程）：停在末帧，回收除当前帧外的 native 内存。
+     * 释放走 native 引用计数，缓存仍持有同一块内存时只是计数 -1，不会悬空；
+     * 被释放帧的 ByteBuffer 随旧数组一起丢弃，后续不可能再触碰已释放内存。
+     */
+    private fun finishLayerPlayback(layer: LayerState) {
+        layer.playbackFinished = true
+        val f = layer.frames ?: return
+        if (f.size <= 1) return
+        val keepIdx = layer.currentFrameIndex.coerceIn(0, f.size - 1)
+        val keep = f[keepIdx]
+        val rest = Array(f.size - 1) { i -> f[if (i < keepIdx) i else i + 1] }
+        try {
+            val freedKB = WebPYUVDecoder.releaseNativeBuffers(rest)
+            WebpLog.i(TAG, "finishLayerPlayback: resId=${layer.config.resId} 播完(loop=${layer.loopCount})，回收 ${f.size - 1} 帧，freed=$freedKB KB")
+        } catch (t: Throwable) {
+            WebpLog.e(TAG, "finishLayerPlayback: release failed: ${t.message}")
+        }
+        layer.frames = arrayOf(keep)
+        layer.currentFrameIndex = 0
+        layer.framesTrimmed = true
+    }
+
     private fun applyAnim(layer: LayerState, anim: WebPAnimResult) {
         layer.releaseNativeFrames()
         val arr = anim.frames ?: return
@@ -381,7 +429,11 @@ private class MultiRenderer(
         layer.frameWidth      = anim.canvasWidth
         layer.frameHeight     = anim.canvasHeight
         layer.currentFrameIndex = 0
-        layer.lastFrameTimeMs   = System.currentTimeMillis()
+        layer.lastFrameTimeMs   = SystemClock.uptimeMillis()
+        layer.loopCount         = anim.loopCount
+        layer.completedLoops    = 0
+        layer.playbackFinished  = false
+        layer.framesTrimmed     = false
 
         val fps = layer.effectiveFps()
         layer.frameDurations = if (fps > 0) {
@@ -458,6 +510,7 @@ private class MultiRenderer(
         playing = false
         layers.forEach { layer ->
             layer.releaseNativeFrames()
+            layer.replacePendingAnim(null)
             if (layer.texId[0] != 0) {
                 try { GLES20.glDeleteTextures(1, layer.texId, 0) } catch (_: Throwable) {}
                 layer.texId[0] = 0
@@ -520,6 +573,18 @@ private fun LayerState.releaseNativeFrames() {
     try { WebPYUVDecoder.releaseNativeBuffers(f) } catch (_: Throwable) {}
     frames = null
     textureAllocated = false
+}
+
+/**
+ * 替换 pendingAnim 并释放被覆盖的旧值——未消费的 pendingAnim 持有 native buffer，
+ * 覆盖前不释放就泄漏一份完整动画。
+ */
+private fun LayerState.replacePendingAnim(anim: WebPAnimResult?) {
+    val old = pendingAnim
+    pendingAnim = anim
+    if (old != null && old !== anim) {
+        old.frames?.let { try { WebPYUVDecoder.releaseNativeBuffers(it) } catch (_: Throwable) {} }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +729,14 @@ open class MultiWebpGLView @JvmOverloads constructor(
     /** Start (or resume) playback of all layers. */
     fun start() {
         if (isDestroyed) return
+        // 有限循环图层播完后帧内存已回收：重播需重新加载（缓存命中时只是引用计数+1）。
+        // 新数据未到前 GL 侧继续显示停留的末帧，不会闪黑。
+        layerStates.forEach { state ->
+            if (state.playbackFinished && state.framesTrimmed) {
+                WebpLog.d(TAG, "start: 图层 resId=${state.config.resId} 已播完且回收，重新加载重播")
+                loadLayerAsync(state, layersGeneration)
+            }
+        }
         renderer.setCustomPlaying(true)
         queueEvent { renderer.setCustomPlaying(true) }
         requestRender()
@@ -709,8 +782,8 @@ open class MultiWebpGLView @JvmOverloads constructor(
                 return@launch
             }
             WebpLog.d(TAG, "loadLayerAsync done: resId=${cfg.resId}, frames=${anim.frames?.size}")
-            // Deliver to GL thread
-            state.pendingAnim = anim
+            // Deliver to GL thread（覆盖前先释放未消费的旧 pendingAnim）
+            state.replacePendingAnim(anim)
             queueEvent {
                 if (!isDestroyed && generation == layersGeneration) {
                     renderer.applyPendingAnim(state)

@@ -52,7 +52,16 @@ open class WebpGLView @JvmOverloads constructor(
 
     private val renderer = WebpRenderer { if (!isDestroyed) requestRender() }
     private val deviceProfile = WebpDeviceProfile.current()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var scopeJob = SupervisorJob()
+    private var scope = CoroutineScope(scopeJob + Dispatchers.Main.immediate)
+
+    /** detach 时 scope 被 cancel，view 复用（重新 attach）时必须重建，否则后续 launch 静默不执行 */
+    private fun recreateScopeIfNeeded() {
+        if (scopeJob.isCancelled) {
+            scopeJob = SupervisorJob()
+            scope = CoroutineScope(scopeJob + Dispatchers.Main.immediate)
+        }
+    }
 
     private val lifecycleObserver by lazy {
         object : DefaultLifecycleObserver {
@@ -73,6 +82,10 @@ open class WebpGLView @JvmOverloads constructor(
     }
     @RawRes
     private var resId: Int? = null
+
+    // 记住最近一次 setWebpFromRaw 的参数，播完回收后重播（start）时按原参数重新加载
+    private var lastSize: Size? = null
+    private var lastFps: Int = 20
 
     @Volatile
     private var isDestroyed = false  // 标记是否已销毁
@@ -126,7 +139,39 @@ open class WebpGLView @JvmOverloads constructor(
             startTime = SystemClock.uptimeMillis()
             WebpLog.d(TAG, "[WebpGLView#$instanceId] Animation started (active: $activeInstances)")
         }
-        queueEvent { renderer.start() }
+
+        // 有限循环动画播完后帧内存已回收：重播需要重新加载（缓存命中时只是引用计数+1，很便宜）
+        val replayRes = resId
+        if (replayRes != null && renderer.needsReloadForReplay()) {
+            WebpLog.d(TAG, "[WebpGLView#$instanceId] start: 播放已完成且帧已回收，重新加载 resId=$replayRes 重播")
+            reloadAndPlay(replayRes)
+            return
+        }
+
+        queueEvent {
+            // 播完但帧未回收（如单帧）时从头重播；普通暂停恢复不受影响（no-op）
+            renderer.restartIfFinished()
+            renderer.start()
+        }
+    }
+
+    private fun reloadAndPlay(@RawRes res: Int) {
+        scope.launch(deviceProfile.decodeDispatcher()) {
+            if (isDestroyed) return@launch
+            val anim = WebPAnimResultManager.getWebPAnimResult(res, lastSize)
+            if (anim == null) {
+                WebpLog.e(TAG, "[WebpGLView#$instanceId] reloadAndPlay: decode 返回 null resId=$res")
+                return@launch
+            }
+            queueEvent {
+                if (isDestroyed) {
+                    anim.frames?.let { runCatching { WebPYUVDecoder.releaseNativeBuffers(it) } }
+                    return@queueEvent
+                }
+                renderer.setFromAnimResult(anim, lastSize, lastFps)
+                renderer.start()
+            }
+        }
     }
 
     fun stop() {
@@ -161,6 +206,8 @@ open class WebpGLView @JvmOverloads constructor(
         }
         val oldResId = this.resId
         this.resId = resId
+        this.lastSize = size
+        this.lastFps = fps
         WebpLog.d(TAG, "[WebpGLView#$instanceId] setWebpFromRaw: $oldResId -> $resId, size=$size, fps=$fps")
 
         scope.launch(deviceProfile.decodeDispatcher()) {
@@ -205,6 +252,7 @@ open class WebpGLView @JvmOverloads constructor(
         super.onAttachedToWindow()
         // 重置销毁标志（view可能被重用）
         isDestroyed = false
+        recreateScopeIfNeeded()
         WebpLog.d(TAG, "[WebpGLView#$instanceId] onAttachedToWindow: resId=$resId")
 
         if (!debugRenderingEnabled) {
