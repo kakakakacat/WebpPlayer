@@ -1,11 +1,13 @@
 package io.webpkit.player
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.hardware.HardwareBuffer
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.opengl.GLUtils
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.Looper
@@ -56,6 +58,30 @@ data class WebpLayer(
     val fps: Int = 0,
     val decodeSize: Size? = null,
     val visible: Boolean = true,
+)
+
+/**
+ * One dynamic sprite drawn **above** all WebP layers, sharing the same quad/program.
+ * Unlike [WebpLayer] (a decoded WebP at a fixed slot), sprites are app-driven: the host
+ * pushes a fresh list every frame via [MultiWebpGLView.updateSprites], so position/alpha
+ * can change per frame with **no main-thread View invalidate** (rendering happens on the
+ * GL thread). The bitmap is referenced by [texIndex] into the list given to
+ * [MultiWebpGLView.setSpriteBitmaps].
+ *
+ * @param texIndex Index into the bitmap list registered via [MultiWebpGLView.setSpriteBitmaps].
+ * @param x        Left edge in **view pixels** (top-left origin).
+ * @param y        Top edge in **view pixels** (top-left origin).
+ * @param width    Display width in view pixels.
+ * @param height   Display height in view pixels.
+ * @param alpha    Opacity multiplier 0..1 (applied on top of the texture's own alpha).
+ */
+data class SpriteInstance(
+    val texIndex: Int,
+    val x: Float,
+    val y: Float,
+    val width: Float,
+    val height: Float,
+    val alpha: Float = 1f,
 )
 
 // ---------------------------------------------------------------------------
@@ -187,8 +213,9 @@ private class MultiRenderer(
         precision mediump float;
         varying vec2 vTexCoord;
         uniform sampler2D tex;
+        uniform float uAlpha;
         void main() {
-            gl_FragColor = texture2D(tex, vTexCoord);
+            gl_FragColor = texture2D(tex, vTexCoord) * uAlpha;
         }
     """.trimIndent()
 
@@ -197,6 +224,7 @@ private class MultiRenderer(
     private var aTexLoc   = 0
     private var uMvpLoc   = 0
     private var uTexLoc   = 0
+    private var uAlphaLoc = 0
 
     private var viewWidth  = 0
     private var viewHeight = 0
@@ -209,6 +237,15 @@ private class MultiRenderer(
     // Layers list — written only from GL thread or before surface is created
     @Volatile
     private var layers: List<LayerState> = emptyList()
+
+    // Dynamic sprite overlay (app-driven; e.g. floating bubbles). Drawn above all webp
+    // layers using the shared quad/program with per-instance alpha. [spriteBitmaps] +
+    // [spriteTexIds] are GL-thread state; [spriteInstances] is a @Volatile reference swapped
+    // wholesale from the caller each frame (immutable list → safe to read on GL thread).
+    private var spriteBitmaps: List<Bitmap> = emptyList()
+    private var spriteTexIds: IntArray = IntArray(0)
+    @Volatile private var spriteInstances: List<SpriteInstance> = emptyList()
+    private val spriteMvp = FloatArray(16)
 
     // Frame-pacing handler (main looper, lightweight)
     private val frameHandler = Handler(Looper.getMainLooper())
@@ -296,6 +333,48 @@ private class MultiRenderer(
         layer.computeMvp(viewWidth, viewHeight)
     }
 
+    /** Upload the sprite texture set (GL thread). Replaces any previous set. */
+    fun applySpriteBitmaps(bitmaps: List<Bitmap>) {
+        if (spriteTexIds.isNotEmpty()) {
+            try { GLES20.glDeleteTextures(spriteTexIds.size, spriteTexIds, 0) } catch (_: Throwable) {}
+            spriteTexIds = IntArray(0)
+        }
+        spriteBitmaps = bitmaps
+        if (bitmaps.isEmpty() || program == 0) return
+        val ids = IntArray(bitmaps.size)
+        GLES20.glGenTextures(bitmaps.size, ids, 0)
+        bitmaps.forEachIndexed { i, bmp ->
+            configureTexture(ids[i])
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[i])
+            runCatching {
+                if (!bmp.isRecycled) GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+            }
+        }
+        spriteTexIds = ids
+    }
+
+    /** Swap the per-frame sprite instance list (any thread; immutable reference). */
+    fun setSpriteInstances(list: List<SpriteInstance>) {
+        spriteInstances = list
+    }
+
+    /** Map a pixel rect (top-left origin) → MVP for the shared [-1,1] quad. */
+    private fun computeSpriteMvp(out: FloatArray, x: Float, y: Float, w: Float, h: Float) {
+        if (viewWidth == 0 || viewHeight == 0 || w <= 0f || h <= 0f) {
+            Matrix.setIdentityM(out, 0)
+            return
+        }
+        val vw = viewWidth.toFloat()
+        val vh = viewHeight.toFloat()
+        val sx = w / vw
+        val sy = h / vh
+        val cx = (x + w * 0.5f) / vw * 2f - 1f
+        val cy = 1f - (y + h * 0.5f) / vh * 2f
+        Matrix.setIdentityM(out, 0)
+        Matrix.translateM(out, 0, cx, cy, 0f)
+        Matrix.scaleM(out, 0, sx, sy, 1f)
+    }
+
     // ---------------------------------------------------------------------------
     // GLSurfaceView.Renderer
     // ---------------------------------------------------------------------------
@@ -311,6 +390,7 @@ private class MultiRenderer(
         aTexLoc   = GLES20.glGetAttribLocation(program,  "aTexCoord")
         uMvpLoc   = GLES20.glGetUniformLocation(program, "uMVP")
         uTexLoc   = GLES20.glGetUniformLocation(program, "tex")
+        uAlphaLoc = GLES20.glGetUniformLocation(program, "uAlpha")
 
         // (Re)allocate textures for any layer that already has data
         layers.forEach { layer ->
@@ -334,6 +414,9 @@ private class MultiRenderer(
                 uploadFrame(layer)
             }
         }
+
+        // Re-upload sprite textures (lost with the old GL context).
+        if (spriteBitmaps.isNotEmpty()) applySpriteBitmaps(spriteBitmaps)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -370,6 +453,8 @@ private class MultiRenderer(
         GLES20.glVertexAttribPointer(aTexLoc, 2, GLES20.GL_FLOAT, false, 0, sharedTexBuffer)
         GLES20.glUniform1i(uTexLoc, 0)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        // WebP layers are fully opaque (alpha comes from the texture); sprites override below.
+        GLES20.glUniform1f(uAlphaLoc, 1f)
 
         var nextWakeMs = Long.MAX_VALUE
         val now = SystemClock.uptimeMillis()
@@ -437,6 +522,22 @@ private class MultiRenderer(
             GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, layer.mvp, 0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texToBind)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        }
+
+        // Dynamic sprites — drawn above all webp layers with per-instance position + alpha.
+        // Geometry attribs are still bound from the layer pass above.
+        val sprites = spriteInstances
+        val sids = spriteTexIds
+        if (sprites.isNotEmpty() && sids.isNotEmpty()) {
+            sprites.forEach { s ->
+                val tex = sids.getOrNull(s.texIndex) ?: return@forEach
+                if (tex == 0) return@forEach
+                computeSpriteMvp(spriteMvp, s.x, s.y, s.width, s.height)
+                GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, spriteMvp, 0)
+                GLES20.glUniform1f(uAlphaLoc, s.alpha)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            }
         }
 
         GLES20.glDisableVertexAttribArray(aPosLoc)
@@ -647,6 +748,11 @@ private class MultiRenderer(
                 layer.texId[0] = 0
             }
         }
+        if (spriteTexIds.isNotEmpty()) {
+            try { GLES20.glDeleteTextures(spriteTexIds.size, spriteTexIds, 0) } catch (_: Throwable) {}
+            spriteTexIds = IntArray(0)
+        }
+        spriteInstances = emptyList()
         if (program != 0) {
             try { GLES20.glDeleteProgram(program) } catch (_: Throwable) {}
             program = 0
@@ -925,6 +1031,29 @@ open class MultiWebpGLView @JvmOverloads constructor(
         state.posX = x
         state.posY = y
         queueEvent { renderer.setLayerPosition(index, x, y) }
+        requestRender()
+    }
+
+    /**
+     * Register the bitmap set used by dynamic sprites (see [SpriteInstance.texIndex]).
+     * Upload happens on the GL thread; keep the bitmaps alive (they are re-uploaded if the
+     * GL context is recreated). Pass an empty list to drop the sprite textures.
+     */
+    fun setSpriteBitmaps(bitmaps: List<Bitmap>) {
+        if (isDestroyed) return
+        queueEvent { renderer.applySpriteBitmaps(bitmaps) }
+        requestRender()
+    }
+
+    /**
+     * Replace the dynamic sprites drawn above all WebP layers and render one frame.
+     * Cheap enough to call every animation frame from the main thread — the actual draw
+     * runs on the GL thread, so this does **not** invalidate the View hierarchy. Pass an
+     * empty list to clear all sprites.
+     */
+    fun updateSprites(instances: List<SpriteInstance>) {
+        if (isDestroyed) return
+        renderer.setSpriteInstances(instances)
         requestRender()
     }
 
