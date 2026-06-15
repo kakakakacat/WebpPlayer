@@ -46,6 +46,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
     publishing {
         singleVariant("release") {
             withSourcesJar()
@@ -64,6 +68,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.lifecycle:lifecycle-common:2.6.2")
     implementation("androidx.annotation:annotation:1.6.0")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }
 
 publishing {
@@ -86,9 +93,10 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "io.webpkit"
                 artifactId = "player"
-                // 本地联调可覆盖版本号发布到 mavenLocal，正式发布仍用默认值：
-                //   ./gradlew :webpview:publishReleasePublicationToMavenLocal -PpublishVersion=1.0.2-local
-                version = (findProperty("publishVersion") as String?) ?: "1.0.4"
+                // 当前工作区默认按本地联调版本发布，方便其他项目直接从 mavenLocal 引用。
+                // 如需覆盖版本号：
+                //   ./gradlew :webpview:publishReleasePublicationToMavenLocal -PpublishVersion=1.0.4-local
+                version = (findProperty("publishVersion") as String?) ?: "1.0.4-local"
             }
         }
     }

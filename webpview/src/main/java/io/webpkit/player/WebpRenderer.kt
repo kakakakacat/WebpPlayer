@@ -170,6 +170,7 @@ class WebpRenderer(
         foregroundTranslateX = translateX
         foregroundTranslateY = translateY
         foregroundDirty = true
+        requestRender()
     }
 
     /**
@@ -179,6 +180,7 @@ class WebpRenderer(
         foregroundBitmap?.recycle()
         foregroundBitmap = null
         foregroundDirty = true
+        requestRender()
     }
 
     fun start() {
@@ -358,6 +360,12 @@ class WebpRenderer(
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         foregroundTextureAllocated = false
+        // context 重建后 foreground 纹理同样失效：若 bitmap 仍在（CPU 侧引用不随 context 丢失），
+        // 标记 dirty 以便下一帧重新上传，否则 drawForeground 会因 !foregroundTextureAllocated
+        // 提前 return —— 表现为 webp 恢复后 foreground 消失，像是被动画盖住了
+        if (foregroundBitmap?.isRecycled == false) {
+            foregroundDirty = true
+        }
 
         // context 重建后旧纹理全部失效：复位软件纹理状态并恢复已有内容
         textureAllocated = false
@@ -393,6 +401,9 @@ class WebpRenderer(
         viewWidth = width; viewHeight = height
         GLES20.glViewport(0, 0, width, height)
         computeMvp()
+        if (foregroundBitmap?.isRecycled == false) {
+            computeForegroundMvp()
+        }
     }
 
     private fun computeMvp() {

@@ -347,6 +347,7 @@ open class WebpGLView @JvmOverloads constructor(
         queueEvent {
             renderer.setForegroundBitmap(snapshot, gravity, scale, translateX, translateY)
         }
+        requestRender()
     }
 
     fun setContentLayout(
@@ -366,6 +367,7 @@ open class WebpGLView @JvmOverloads constructor(
         queueEvent {
             renderer.clearForeground()
         }
+        requestRender()
     }
 
 
