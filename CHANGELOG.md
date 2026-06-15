@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.5 (2026-06-15)
+
+### New
+- `MultiWebpGLView` now supports app-driven dynamic sprite overlays via
+  `setSpriteBitmaps()` and `updateSprites()`, drawn above all WebP layers in the
+  same GL pass with per-instance position and alpha.
+
+### Fixes
+- `WebpGLView.setForegroundBitmap()` / `clearForeground()` now request a render
+  immediately on `RENDERMODE_WHEN_DIRTY` surfaces, so foreground overlays no
+  longer wait behind WebP frame timing to become visible.
+- Foreground textures are re-uploaded correctly after GL context recreation and
+  their MVP is recomputed on surface-size changes.
+- Added Robolectric regression tests for foreground render wake-up behavior.
+
 ## 1.0.4 (2026-06-10)
 
 ### Performance

@@ -10,3 +10,4 @@ captures/
 *.log
 /mvn-repo/
 benchmark/build/
+gradle/gradle-daemon-jvm.properties

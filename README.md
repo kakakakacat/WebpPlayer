@@ -108,7 +108,7 @@ App `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("io.webpkit:player:1.0.4")
+    implementation("io.webpkit:player:1.0.5")
 }
 ```
 
@@ -119,13 +119,13 @@ dependencies {
 // settings.gradle
 maven { url 'https://raw.githubusercontent.com/kakakakacat/WebpPlayer/mvn-repo/' }
 // build.gradle
-implementation 'io.webpkit:player:1.0.4'
+implementation 'io.webpkit:player:1.0.5'
 ```
 </details>
 
 ### Option B — drop in the AAR manually
 
-Copy `player-1.0.4.aar` into your app's `libs/` folder and add:
+Copy `player-1.0.5.aar` into your app's `libs/` folder and add:
 
 ```kotlin
 dependencies {
