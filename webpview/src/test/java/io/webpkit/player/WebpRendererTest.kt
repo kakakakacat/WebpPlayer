@@ -3,6 +3,7 @@ package io.webpkit.player
 import android.graphics.Bitmap
 import android.content.Context
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -10,6 +11,21 @@ import org.robolectric.RuntimeEnvironment
 
 @RunWith(RobolectricTestRunner::class)
 class WebpRendererTest {
+
+    private class FakeRenderThreadHost : RenderThreadHost {
+        var requestRenderCalls = 0
+        val queuedTasks = mutableListOf<() -> Unit>()
+
+        override fun queueEvent(task: () -> Unit) {
+            queuedTasks += task
+        }
+
+        override fun requestRender() {
+            requestRenderCalls++
+        }
+
+        override fun release() = Unit
+    }
 
     @Test
     fun setForegroundBitmap_requestsRender() {
@@ -48,5 +64,36 @@ class WebpRendererTest {
         view.setForegroundBitmap(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888))
 
         assertEquals(1, view.renderRequests)
+    }
+
+    @Test
+    fun webpTextureViewSetForegroundBitmap_requestsRenderImmediately() {
+        val host = FakeRenderThreadHost()
+        val view = object : WebpTextureView(RuntimeEnvironment.getApplication() as Context) {
+            override fun createRenderHost(renderer: android.opengl.GLSurfaceView.Renderer): RenderThreadHost {
+                return host
+            }
+        }
+
+        view.setForegroundBitmap(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888))
+
+        assertEquals(1, host.requestRenderCalls)
+        assertEquals(1, host.queuedTasks.size)
+    }
+
+    @Test
+    fun multiWebpTextureViewSetLayerVisible_requestsRenderImmediately() {
+        val host = FakeRenderThreadHost()
+        val view = object : MultiWebpTextureView(RuntimeEnvironment.getApplication() as Context) {
+            override fun createRenderHost(renderer: android.opengl.GLSurfaceView.Renderer): RenderThreadHost {
+                return host
+            }
+        }
+
+        view.setLayers(listOf(WebpLayer(resId = 1)))
+        val beforeToggle = host.requestRenderCalls
+        view.setLayerVisible(0, false)
+
+        assertTrue(host.requestRenderCalls > beforeToggle)
     }
 }

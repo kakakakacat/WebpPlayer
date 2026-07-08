@@ -94,8 +94,8 @@ afterEvaluate {
                 groupId = "io.webpkit"
                 artifactId = "player"
                 // 正式发布默认使用当前稳定版本；本地联调可通过 -PpublishVersion 覆盖。
-                //   ./gradlew :webpview:publishReleasePublicationToMavenLocal -PpublishVersion=1.0.5-local
-                version = (findProperty("publishVersion") as String?) ?: "1.0.5"
+                //   ./gradlew :webpview:publishReleasePublicationToMavenLocal -PpublishVersion=1.0.6-local
+                version = (findProperty("publishVersion") as String?) ?: "1.0.6"
             }
         }
     }

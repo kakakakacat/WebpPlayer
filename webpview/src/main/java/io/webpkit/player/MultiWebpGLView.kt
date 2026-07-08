@@ -88,7 +88,7 @@ data class SpriteInstance(
 // Per-layer GL state (all access on GL thread)
 // ---------------------------------------------------------------------------
 
-private class LayerState(val config: WebpLayer) {
+internal class LayerState(val config: WebpLayer) {
     @Volatile var isVisible: Boolean = config.visible
 
     // Live position (view pixels, top-left origin). Initialized from config but can be
@@ -170,7 +170,7 @@ private class LayerState(val config: WebpLayer) {
 // Multi-layer Renderer
 // ---------------------------------------------------------------------------
 
-private class MultiRenderer(
+internal class MultiRenderer(
     private val requestRender: () -> Unit
 ) : GLSurfaceView.Renderer {
 
@@ -799,13 +799,13 @@ private class MultiRenderer(
 // Extension helpers
 // ---------------------------------------------------------------------------
 
-private fun safeRewind(buf: ByteBuffer) {
+internal fun safeRewind(buf: ByteBuffer) {
     try { buf.position(0) } catch (_: Throwable) {
         try { buf.rewind()  } catch (_: Throwable) {}
     }
 }
 
-private fun LayerState.releaseNativeFrames() {
+internal fun LayerState.releaseNativeFrames() {
     frames?.let { try { WebPYUVDecoder.releaseNativeBuffers(it) } catch (_: Throwable) {} }
     frames = null
     releaseHardwareGl()
@@ -820,7 +820,7 @@ private fun LayerState.releaseNativeFrames() {
 }
 
 /** 删除图层硬件帧的 GL 资源（texture + EGLImage），不动 AHardwareBuffer 本体。GL 线程调用。 */
-private fun LayerState.releaseHardwareGl() {
+internal fun LayerState.releaseHardwareGl() {
     if (hwTextures.isNotEmpty()) {
         try { GLES20.glDeleteTextures(hwTextures.size, hwTextures, 0) } catch (_: Throwable) {}
         hwTextures = IntArray(0)
@@ -837,7 +837,7 @@ private fun LayerState.releaseHardwareGl() {
  * 替换 pendingAnim 并释放被覆盖的旧值——未消费的 pendingAnim 持有 native buffer，
  * 覆盖前不释放就泄漏一份完整动画。
  */
-private fun LayerState.replacePendingAnim(anim: WebPAnimResult?) {
+internal fun LayerState.replacePendingAnim(anim: WebPAnimResult?) {
     val old = pendingAnim
     pendingAnim = anim
     if (old != null && old !== anim) {

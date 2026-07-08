@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.6 (2026-07-08)
+
+### New
+- Added `WebpTextureView` and `MultiWebpTextureView`: `TextureView + EGL`
+  variants that reuse the existing WebP GL renderers while participating in the
+  normal Android view hierarchy, so sibling views can draw above them without
+  `SurfaceView` layering workarounds.
+- Added `MultiWebpTextureViewContainer` as a lightweight container for the new
+  multi-layer `TextureView` path.
+
+### Fixes
+- Added regression coverage for immediate render wake-up behavior on the new
+  `TextureView` controls.
+
 ## 1.0.5 (2026-06-15)
 
 ### New
